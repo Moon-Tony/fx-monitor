@@ -5,7 +5,7 @@
 # ============================================================
 
 # 이번 실행의 이름 (결과 폴더 이름과 비교표에 표시됩니다. 조건을 바꿀 때마다 다르게 적어두세요)
-label = "기본"
+label = "익절없음"
 
 # 백테스트 기간. end_date 를 비워두면 오늘까지입니다.
 start_date = "2012-01-01"
@@ -28,7 +28,7 @@ execution = "next_open"             # 체결 시점: "next_open"(다음 거래�
 reentry_after_take_profit = false   # 익절 후 신호가 계속 '상승'이면 바로 다시 살지 (true/false)
 
 [exit]
-take_profit_pct = 5.0     # 수익률이 이 % 에 도달하면 전량 매도 (0 = 사용 안 함)
+take_profit_pct = 0.0     # 수익률이 이 % 에 도달하면 전량 매도 (0 = 사용 안 함)
 stop_loss_pct = 0.0       # 손실이 이 % 에 도달하면 전량 매도 (0 = 사용 안 함)
 exit_on_neutral = true    # '중립' 신호가 되면 전량 매도
 exit_on_down = true       # '하락' 신호가 되면 전량 매도
