@@ -3,6 +3,7 @@
 조건은 backtest_settings.toml 에서만 바꾸면 됩니다 (이 파일은 고치지 않아도 됩니다).
 결과는 backtest_results/ 폴더에 (보고서 report.md, 거래기록 trades.csv, 그래프 equity.png) 저장되고,
 실행할 때마다 backtest_results/summary.csv 에 한 줄씩 쌓여서 조건별 비교가 쉽습니다.
+비교 기준(벤치마크)은 시작일에 같은 금액으로 사서 끝까지 보유한 결과입니다 (기본: 코스피 지수, KODEX 200).
 """
 import csv
 import os
@@ -17,7 +18,12 @@ import pandas as pd
 SETTINGS_FILE = "backtest_settings.toml"
 RESULT_DIR = "backtest_results"
 KST = ZoneInfo("Asia/Seoul")
-NAME = {1: "상승", 0: "중립", -1: "하락"}
+NAMES = {"^KS11": "코스피 지수", "069500.KS": "KODEX 200",
+         "122630.KS": "KODEX 레버리지", "^KQ11": "코스닥 지수"}
+
+
+def nm(ticker):
+    return NAMES.get(ticker, ticker)
 
 
 # ---------------------------------------------------------------- 데이터
@@ -162,8 +168,14 @@ def stats(eq):
     years = (eq.index[-1] - eq.index[0]).days / 365.25
     total = eq.iloc[-1] / eq.iloc[0] - 1
     cagr = (eq.iloc[-1] / eq.iloc[0]) ** (1 / years) - 1 if years > 0 and eq.iloc[-1] > 0 else float("nan")
-    mdd = (eq / eq.cummax() - 1).min()
-    return dict(total=total * 100, cagr=cagr * 100, mdd=mdd * 100)
+    dd = eq / eq.cummax() - 1
+    trough = dd.idxmin()
+    peak = eq.loc[:trough].idxmax()
+    mdd = dd.min() * 100
+    cagr = cagr * 100
+    return dict(total=total * 100, cagr=cagr, mdd=mdd,
+                calmar=(cagr / abs(mdd)) if mdd < 0 else float("nan"),
+                mdd_from=peak.date(), mdd_to=trough.date())
 
 
 def yearly(eq):
@@ -173,7 +185,7 @@ def yearly(eq):
     return (ye / base - 1) * 100
 
 
-def trade_stats(trades, eq, sig):
+def trade_stats(trades):
     n = len(trades)
     if n == 0:
         return dict(n=0, win=float("nan"), avg=float("nan"), hold=float("nan"))
@@ -186,29 +198,65 @@ def fmt(x, d=1):
     return "-" if pd.isna(x) else f"{x:,.{d}f}"
 
 
-def save_outputs(cfg, raw_text, eq, bench, trades, holding, sig, label):
+SUMMARY_HEADER = ["실행시각", "이름", "기간시작", "기간끝", "이평(단/중/장)", "매수/매도 점수",
+                  "신호확인일수", "체결", "익절%", "손절%", "중립청산", "하락청산", "익절후재진입",
+                  "수수료%", "슬리피지%", "전략누적%", "전략CAGR%", "전략MDD%", "거래수", "승률%",
+                  "보유누적%", "보유CAGR%", "보유MDD%", "결과폴더",
+                  "기준종목", "기준CAGR%", "기준MDD%",
+                  "CAGR차이%p(전략-기준)", "MDD차이%p(전략-기준 / +면 덜 빠짐)"]
+
+
+def append_summary(path, row):
+    """summary.csv 에 한 줄 추가 (예전 파일의 제목줄도 새 항목에 맞게 갱신)"""
+    rows = []
+    if os.path.exists(path):
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.reader(f))
+    if rows:
+        rows[0] = SUMMARY_HEADER
+    else:
+        rows = [SUMMARY_HEADER]
+    rows.append(row)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        csv.writer(f, lineterminator="\n").writerows(rows)
+
+
+def save_outputs(cfg, raw_text, eq, benches, primary, trades, holding, label):
     stamp = datetime.now(KST).strftime("%Y%m%d-%H%M")
     safe = re.sub(r"[^\w.-]", "_", label) or "run"
     folder = os.path.join(RESULT_DIR, f"{safe}_{stamp}")
     os.makedirs(folder, exist_ok=True)
 
-    ss, bs = stats(eq), stats(bench)
-    ts = trade_stats(trades, eq, sig)
+    trade_t = cfg["market"]["trade_ticker"]
+    ss = stats(eq)
+    bs = {t: stats(s) for t, s in benches.items()}
+    ts = trade_stats(trades)
     exposure = (eq.pct_change().fillna(0) != 0).mean() * 100
-    ys, yb = yearly(eq), yearly(bench)
+    ys = yearly(eq)
+    yb = {t: yearly(s) for t, s in benches.items()}
+    pb, yp, pname = bs[primary], yb[primary], nm(primary)
 
+    # ---- 그래프: 누적 수익률 + 낙폭
     chart = False
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(figsize=(10, 4.5))
-        ax.plot(eq.index, eq / eq.iloc[0], label="Strategy")
-        ax.plot(bench.index, bench / bench.iloc[0], label="Buy & Hold", alpha=0.7)
-        ax.set_yscale("log")
-        ax.set_title("Equity curve (start = 1.0, log scale)")
-        ax.grid(alpha=0.3)
-        ax.legend()
+        fig, (a1, a2) = plt.subplots(2, 1, figsize=(10, 7.5), sharex=True,
+                                     gridspec_kw={"height_ratios": [3, 2]})
+        a1.plot(eq.index, eq / eq.iloc[0], label="Strategy", linewidth=1.8)
+        for t, s in benches.items():
+            a1.plot(s.index, s / s.iloc[0], label=t, alpha=0.75)
+        a1.set_yscale("log")
+        a1.set_title("Equity curve (start = 1.0, log scale)")
+        a1.grid(alpha=0.3)
+        a1.legend()
+        a2.plot(eq.index, (eq / eq.cummax() - 1) * 100, label="Strategy", linewidth=1.8)
+        s = benches[primary]
+        a2.plot(s.index, (s / s.cummax() - 1) * 100, label=primary, alpha=0.75)
+        a2.set_title("Drawdown (%)")
+        a2.grid(alpha=0.3)
+        a2.legend()
         fig.tight_layout()
         fig.savefig(os.path.join(folder, "equity.png"), dpi=110)
         plt.close(fig)
@@ -218,27 +266,57 @@ def save_outputs(cfg, raw_text, eq, bench, trades, holding, sig, label):
 
     trades.to_csv(os.path.join(folder, "trades.csv"), index=False, encoding="utf-8-sig")
 
+    # ---- 보고서
+    tickers = list(benches.keys())
+    heads = [f"{nm(t)}" + (" 보유" if t == trade_t else " 보유(벤치마크)" if t == primary else " 보유") for t in tickers]
     L = [f"# 백테스트 결과: {label}", "",
          f"- 실행 시각: {datetime.now(KST):%Y-%m-%d %H:%M} (KST)",
          f"- 기간: {eq.index[0].date()} ~ {eq.index[-1].date()}",
-         f"- 매매 종목: {cfg['market']['trade_ticker']}", "",
-         "## 핵심 성과", "",
-         "| 항목 | 이 전략 | 그냥 보유(Buy & Hold) |", "|---|---|---|",
-         f"| 누적 수익률(%) | {fmt(ss['total'])} | {fmt(bs['total'])} |",
-         f"| 연평균 수익률 CAGR(%) | {fmt(ss['cagr'])} | {fmt(bs['cagr'])} |",
-         f"| 최대 낙폭 MDD(%) | {fmt(ss['mdd'])} | {fmt(bs['mdd'])} |",
-         f"| 거래 횟수 | {ts['n']} | - |",
-         f"| 승률(%) | {fmt(ts['win'])} | - |",
-         f"| 거래당 평균 수익률(%) | {fmt(ts['avg'], 2)} | - |",
-         f"| 평균 보유일 | {fmt(ts['hold'])} | - |",
-         f"| 보유 중이었던 날 비율(%) | {fmt(exposure)} | 100 |", ""]
+         f"- 매매 종목: {nm(trade_t)} ({trade_t})",
+         f"- 비교 기준(벤치마크): 시작일에 같은 금액으로 사서 끝까지 보유 / 목표 판정 기준은 **{pname}**", "",
+         "## 목표 달성 체크", "",
+         f"목표: 같은 기간 {pname} 수익률을 소폭이라도 넘으면서, 최대 낙폭은 더 작게", ""]
+    ok1 = ss["cagr"] > pb["cagr"]
+    ok2 = abs(ss["mdd"]) < abs(pb["mdd"])
+    up = [y for y in ys.index if y in yp.index and yp[y] > 0]
+    down = [y for y in ys.index if y in yp.index and yp[y] < 0]
+    up_win = sum(1 for y in up if ys[y] > yp[y])
+    down_win = sum(1 for y in down if ys[y] > yp[y])
+    verdict = ("두 가지 목표를 모두 충족했습니다" if ok1 and ok2 else
+               "한 가지만 충족했습니다" if ok1 or ok2 else "두 가지 모두 충족하지 못했습니다")
+    L += [f"- {'✅' if ok1 else '❌'} **수익률**: 연평균 {fmt(ss['cagr'])}% vs {pname} {fmt(pb['cagr'])}% "
+          f"(차이 {ss['cagr'] - pb['cagr']:+.1f}%p)",
+          f"- {'✅' if ok2 else '❌'} **낙폭**: 최대 낙폭 {fmt(ss['mdd'])}% vs {pname} {fmt(pb['mdd'])}% "
+          f"(전략이 {abs(abs(ss['mdd']) - abs(pb['mdd'])):.1f}%p {'더 작음' if ok2 else '더 큼'})",
+          f"- 참고: {pname}가 오른 {len(up)}개 연도 중 전략이 앞선 해 {up_win}개, "
+          f"내린 {len(down)}개 연도 중 전략이 덜 잃은 해 {down_win}개 (첫 해와 마지막 해는 일부 기간만 포함)",
+          f"- 종합: **{verdict}**", "",
+          "## 핵심 성과", "",
+          "| 항목 | 이 전략 | " + " | ".join(heads) + " |",
+          "|---|---|" + "---|" * len(tickers),
+          f"| 누적 수익률(%) | {fmt(ss['total'])} | " + " | ".join(fmt(bs[t]['total']) for t in tickers) + " |",
+          f"| 연평균 수익률 CAGR(%) | {fmt(ss['cagr'])} | " + " | ".join(fmt(bs[t]['cagr']) for t in tickers) + " |",
+          f"| 최대 낙폭 MDD(%) | {fmt(ss['mdd'])} | " + " | ".join(fmt(bs[t]['mdd']) for t in tickers) + " |",
+          f"| 낙폭 대비 수익 (CAGR ÷ 최대낙폭) | {fmt(ss['calmar'], 2)} | " + " | ".join(fmt(bs[t]['calmar'], 2) for t in tickers) + " |",
+          f"| 최대 낙폭 구간 | {ss['mdd_from']} → {ss['mdd_to']} | " + " | ".join(f"{bs[t]['mdd_from']} → {bs[t]['mdd_to']}" for t in tickers) + " |",
+          "",
+          "| 전략 매매 정보 | 값 |", "|---|---|",
+          f"| 거래 횟수 | {ts['n']} |",
+          f"| 승률(%) | {fmt(ts['win'])} |",
+          f"| 거래당 평균 수익률(%) | {fmt(ts['avg'], 2)} |",
+          f"| 평균 보유일 | {fmt(ts['hold'])} |",
+          f"| 보유 중이었던 날 비율(%) | {fmt(exposure)} |", ""]
     if holding:
         L += [f"- 백테스트 종료 시점에 보유 중: {holding['entry_date']} 진입, 현재 수익률 {holding['return_pct']}%", ""]
     if chart:
         L += ["![equity](equity.png)", ""]
-    L += ["## 연도별 수익률(%)", "", "| 연도 | 이 전략 | 그냥 보유 |", "|---|---|---|"]
+    L += ["## 연도별 수익률(%)", "",
+          "| 연도 | 이 전략 | " + " | ".join(nm(t) for t in tickers) + f" | 전략 - {pname} (%p) |",
+          "|---|---|" + "---|" * len(tickers) + "---|"]
     for y in ys.index:
-        L.append(f"| {y} | {fmt(ys[y])} | {fmt(yb.get(y, float('nan')))} |")
+        diff = ys[y] - yp[y] if y in yp.index else float("nan")
+        L.append(f"| {y} | {fmt(ys[y])} | " + " | ".join(fmt(yb[t].get(y, float('nan'))) for t in tickers)
+                 + f" | {'-' if pd.isna(diff) else f'{diff:+.1f}'} |")
     L += ["", "## 최근 거래 30건", ""]
     if len(trades):
         L += ["| 진입일 | 진입가 | 청산일 | 청산가 | 사유 | 수익률(%) | 보유일 |", "|---|---|---|---|---|---|---|"]
@@ -250,6 +328,8 @@ def save_outputs(cfg, raw_text, eq, bench, trades, holding, sig, label):
     L += ["", "## 가정과 한계 (꼭 읽어주세요)", "",
           "- 신호는 외환 **일봉 종가** 기준이고, 매매는 **다음 코스피 거래일**에 체결된다고 가정했습니다(미래 데이터 엿보기 방지).",
           "- 실제 알림은 15분마다 장중 가격으로 판단하므로 결과가 이 백테스트와 다를 수 있습니다.",
+          "- 벤치마크는 시작일 종가에 같은 금액을 넣어 끝까지 보유한 것으로 계산했습니다. 코스피 지수는 배당이 빠진 가격 지수이고, ETF는 배당이 반영된 조정주가입니다.",
+          "- 전략은 시장 밖에 있는 동안 현금 이자를 0%로 계산했습니다.",
           "- 전액 매수이며 소수점 수량도 허용합니다. 호가 단위, 미체결, 시초가 급변은 반영하지 않았습니다.",
           "- 같은 날 손절과 익절이 모두 가능한 경우 손절이 먼저라고 보수적으로 가정했습니다.",
           "- 과거 결과가 미래를 보장하지 않습니다. 조건을 여러 번 바꿔가며 가장 좋은 값만 고르면 과거에만 잘 맞는 설정(과최적화)이 되기 쉽습니다. 연도별 결과가 고르게 좋은지 함께 보세요.",
@@ -257,25 +337,21 @@ def save_outputs(cfg, raw_text, eq, bench, trades, holding, sig, label):
     with open(os.path.join(folder, "report.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(L))
 
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    path = os.path.join(RESULT_DIR, "summary.csv")
-    new = not os.path.exists(path)
+    # ---- 비교표(summary.csv)
     sg, en, ex, co = cfg["signal"], cfg["entry"], cfg["exit"], cfg["cost"]
-    with open(path, "a", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f)
-        if new:
-            w.writerow(["실행시각", "이름", "기간시작", "기간끝", "이평(단/중/장)", "매수/매도 점수",
-                        "신호확인일수", "체결", "익절%", "손절%", "중립청산", "하락청산", "익절후재진입",
-                        "수수료%", "슬리피지%", "전략누적%", "전략CAGR%", "전략MDD%", "거래수", "승률%",
-                        "보유누적%", "보유CAGR%", "보유MDD%", "결과폴더"])
-        w.writerow([datetime.now(KST).strftime("%Y-%m-%d %H:%M"), label, eq.index[0].date(), eq.index[-1].date(),
-                    f"{sg['ma_short']}/{sg['ma_mid']}/{sg['ma_long']}", f"{sg['buy_threshold']}/{sg['sell_threshold']}",
-                    sg["confirm_days"], en["execution"], ex["take_profit_pct"], ex["stop_loss_pct"],
-                    ex["exit_on_neutral"], ex["exit_on_down"], en["reentry_after_take_profit"],
-                    co["fee_pct_per_side"], co["slippage_pct_per_side"],
-                    round(ss["total"], 1), round(ss["cagr"], 1), round(ss["mdd"], 1), ts["n"], round(ts["win"], 1) if ts["n"] else "",
-                    round(bs["total"], 1), round(bs["cagr"], 1), round(bs["mdd"], 1), folder])
-    return folder, ss, bs, ts
+    hb = bs[trade_t]
+    append_summary(os.path.join(RESULT_DIR, "summary.csv"), [
+        datetime.now(KST).strftime("%Y-%m-%d %H:%M"), label, eq.index[0].date(), eq.index[-1].date(),
+        f"{sg['ma_short']}/{sg['ma_mid']}/{sg['ma_long']}", f"{sg['buy_threshold']}/{sg['sell_threshold']}",
+        sg["confirm_days"], en["execution"], ex["take_profit_pct"], ex["stop_loss_pct"],
+        ex["exit_on_neutral"], ex["exit_on_down"], en["reentry_after_take_profit"],
+        co["fee_pct_per_side"], co["slippage_pct_per_side"],
+        round(ss["total"], 1), round(ss["cagr"], 1), round(ss["mdd"], 1), ts["n"],
+        round(ts["win"], 1) if ts["n"] else "",
+        round(hb["total"], 1), round(hb["cagr"], 1), round(hb["mdd"], 1), folder,
+        pname, round(pb["cagr"], 1), round(pb["mdd"], 1),
+        round(ss["cagr"] - pb["cagr"], 1), round(ss["mdd"] - pb["mdd"], 1)])
+    return folder, ss, pb, pname, ts
 
 
 # ---------------------------------------------------------------- 실행
@@ -283,6 +359,7 @@ DEFAULTS = {
     "start_date": "2012-01-01", "end_date": "", "label": "기본",
     "market": {"trade_ticker": "122630.KS",
                "fx_pairs": ["EURUSD=X", "GBPUSD=X", "AUDUSD=X"]},
+    "benchmark": {"tickers": ["^KS11", "069500.KS"]},
     "signal": {"ma_short": 5, "ma_mid": 10, "ma_long": 20,
                "buy_threshold": 2, "sell_threshold": -2, "confirm_days": 1},
     "entry": {"execution": "next_open", "reentry_after_take_profit": False},
@@ -307,8 +384,9 @@ def run(cfg, raw_text="", loader=download):
     start = cfg["start_date"]
     end = cfg["end_date"] or None
     warm = (pd.Timestamp(start) - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+    trade_t = cfg["market"]["trade_ticker"]
     fx = {p: loader(p, warm, end) for p in cfg["market"]["fx_pairs"]}
-    px = loader(cfg["market"]["trade_ticker"], start, end)
+    px = loader(trade_t, start, end)
 
     sig = align(build_signal(fx, cfg["signal"]), px.index).dropna()
     px = px.loc[sig.index]
@@ -317,19 +395,28 @@ def run(cfg, raw_text="", loader=download):
     if len(px) < 30:
         raise ValueError("백테스트에 쓸 데이터가 너무 적습니다 (기간/종목 코드를 확인하세요)")
 
+    # 벤치마크: 전략과 같은 날짜에서 시작해 같은 금액을 넣고 끝까지 보유
+    tickers = [t for t in cfg["benchmark"]["tickers"] if t]
+    primary = tickers[0] if tickers else trade_t
+    refs = tickers + ([trade_t] if trade_t not in tickers else [])
+    benches = {}
+    for t in refs:
+        close = px["Close"] if t == trade_t else loader(t, warm, end)["Close"]
+        s = close.reindex(px.index, method="ffill").dropna()
+        benches[t] = s / s.iloc[0]
+
     eq, trades, holding = simulate(px, sig, cfg)
-    bench = px["Close"]
-    return save_outputs(cfg, raw_text, eq, bench, trades, holding, sig, cfg["label"])
+    return save_outputs(cfg, raw_text, eq, benches, primary, trades, holding, cfg["label"])
 
 
 def main():
     with open(SETTINGS_FILE, "rb") as f:
         raw = f.read()
     cfg = merged(tomllib.loads(raw.decode("utf-8")))
-    folder, ss, bs, ts = run(cfg, raw.decode("utf-8"))
+    folder, ss, pb, pname, ts = run(cfg, raw.decode("utf-8"))
     print(f"결과 폴더: {folder}")
     print(f"전략  누적 {ss['total']:.1f}%  CAGR {ss['cagr']:.1f}%  MDD {ss['mdd']:.1f}%  거래 {ts['n']}회")
-    print(f"보유  누적 {bs['total']:.1f}%  CAGR {bs['cagr']:.1f}%  MDD {bs['mdd']:.1f}%")
+    print(f"{pname}  누적 {pb['total']:.1f}%  CAGR {pb['cagr']:.1f}%  MDD {pb['mdd']:.1f}%")
 
 
 if __name__ == "__main__":
