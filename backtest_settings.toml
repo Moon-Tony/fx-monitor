@@ -5,14 +5,14 @@
 # ============================================================
 
 # 이번 실행의 이름 (결과 폴더 이름과 비교표에 표시됩니다. 조건을 바꿀 때마다 다르게 적어두세요)
-label = "익절없음_벤치마크"
+label = "A_KODEX200"
 
 # 백테스트 기간. end_date 를 비워두면 오늘까지입니다.
 start_date = "2012-01-01"
 end_date = ""
 
 [market]
-trade_ticker = "122630.KS"                         # 매매할 종목 (KODEX 레버리지)
+trade_ticker = "069500.KS"                         # 매매할 종목 (KODEX 레버리지)
 fx_pairs = ["EURUSD=X", "GBPUSD=X", "AUDUSD=X"]    # 점수를 매길 외환
 
 [benchmark]
