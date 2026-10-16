@@ -3,7 +3,7 @@
 조건은 backtest_settings.toml 에서만 바꾸면 됩니다 (이 파일은 고치지 않아도 됩니다).
 결과는 backtest_results/ 폴더에 (보고서 report.md, 거래기록 trades.csv, 그래프 equity.png) 저장되고,
 실행할 때마다 backtest_results/summary.csv 에 한 줄씩 쌓여서 조건별 비교가 쉽습니다.
-비교 기준(벤치마크)은 시작일에 같은 금액으로 사서 끝까지 보유한 결과입니다 (기본: 코스피 지수, KODEX 200).
+비교 기준(벤치마크)은 시작일에 같은 금액으로 사서 끝까지 보유한 결과입니다 (기본: KODEX 200).
 """
 import csv
 import os
@@ -93,18 +93,20 @@ def simulate(px, sig, cfg):
     tp, sl = ex["take_profit_pct"] / 100, ex["stop_loss_pct"] / 100
     on_neutral, on_down = bool(ex["exit_on_neutral"]), bool(ex["exit_on_down"])
     fee, slip = co["fee_pct_per_side"] / 100, co["slippage_pct_per_side"] / 100
+    frac = float(en["invest_fraction"])
 
     st = dict(cash=1.0, shares=0.0, in_pos=False, entry=0.0, dt=None, base=1.0, rearm=False)
     trades, eq = [], []
 
     def buy(dt, price):
         fill = price * (1 + slip)
-        st.update(base=st["cash"], shares=st["cash"] * (1 - fee) / fill, cash=0.0,
+        invest = st["cash"] * frac          # 현금 중 이 비율만 투자, 나머지는 현금으로 남김
+        st.update(base=st["cash"], shares=invest * (1 - fee) / fill, cash=st["cash"] - invest,
                   in_pos=True, entry=fill, dt=dt, rearm=False)
 
     def sell(dt, price, reason):
         fill = price * (1 - slip)
-        cash = st["shares"] * fill * (1 - fee)
+        cash = st["cash"] + st["shares"] * fill * (1 - fee)
         trades.append(dict(entry_date=st["dt"].date(), entry_price=round(st["entry"], 2),
                            exit_date=dt.date(), exit_price=round(fill, 2), reason=reason,
                            return_pct=round((cash / st["base"] - 1) * 100, 2),
@@ -159,7 +161,7 @@ def simulate(px, sig, cfg):
     if st["in_pos"]:
         holding = dict(entry_date=st["dt"].date(), entry_price=round(st["entry"], 2),
                        now_price=round(px["Close"].iloc[-1], 2),
-                       return_pct=round((st["shares"] * px["Close"].iloc[-1] / st["base"] - 1) * 100, 2))
+                       return_pct=round(((st["cash"] + st["shares"] * px["Close"].iloc[-1]) / st["base"] - 1) * 100, 2))
     return pd.Series(eq, index=px.index), pd.DataFrame(trades), holding
 
 
@@ -193,6 +195,31 @@ def trade_stats(trades):
                 avg=trades["return_pct"].mean(), hold=trades["hold_days"].mean())
 
 
+def window_summary(trades, eq, d0, d1):
+    """최대 낙폭 구간(고점일 d0 -> 저점일 d1) 안에서 청산된 거래들의 요약"""
+    if len(trades) == 0:
+        return dict(n=0)
+    t = trades[(trades["exit_date"] > d0) & (trades["exit_date"] <= d1)]
+    if len(t) == 0:
+        return dict(n=0)
+    rets = t["return_pct"].tolist()
+    comp, run, best = 1.0, 0, 0
+    for r in rets:
+        comp *= 1 + r / 100
+        run = run + 1 if r < 0 else 0
+        best = max(best, run)
+    wins = [r for r in rets if r > 0]
+    losses = [r for r in rets if r < 0]
+    seg = eq.loc[pd.Timestamp(d0):pd.Timestamp(d1)]
+    return dict(n=len(t), wins=len(wins), losses=len(losses),
+                win_rate=len(wins) / len(t) * 100,
+                avg_win=(sum(wins) / len(wins)) if wins else float("nan"),
+                avg_loss=(sum(losses) / len(losses)) if losses else float("nan"),
+                comp=(comp - 1) * 100, streak=best,
+                exposure=(seg.pct_change().fillna(0) != 0).mean() * 100,
+                worst=t.nsmallest(5, "return_pct"))
+
+
 # ---------------------------------------------------------------- 보고서
 def fmt(x, d=1):
     return "-" if pd.isna(x) else f"{x:,.{d}f}"
@@ -203,22 +230,24 @@ SUMMARY_HEADER = ["실행시각", "이름", "기간시작", "기간끝", "이평
                   "수수료%", "슬리피지%", "전략누적%", "전략CAGR%", "전략MDD%", "거래수", "승률%",
                   "보유누적%", "보유CAGR%", "보유MDD%", "결과폴더",
                   "기준종목", "기준CAGR%", "기준MDD%",
-                  "CAGR차이%p(전략-기준)", "MDD차이%p(전략-기준 / +면 덜 빠짐)"]
+                  "CAGR차이%p(전략-기준)", "MDD차이%p(전략-기준 / +면 덜 빠짐)", "투자비중"]
 
 
 def append_summary(path, row):
-    """summary.csv 에 한 줄 추가 (예전 파일의 제목줄도 새 항목에 맞게 갱신)"""
-    rows = []
+    """summary.csv 에 한 줄 추가 (제목줄을 새 항목에 맞추고, 예전 줄도 칸 수를 자동으로 맞춤)"""
+    body = []
     if os.path.exists(path):
         with open(path, encoding="utf-8-sig", newline="") as f:
-            rows = list(csv.reader(f))
-    if rows:
-        rows[0] = SUMMARY_HEADER
-    else:
-        rows = [SUMMARY_HEADER]
-    rows.append(row)
+            body = list(csv.reader(f))[1:]
+    width = len(SUMMARY_HEADER)
+    fixed = []
+    for r in body + [row]:
+        if len(r) < width:                       # 예전에 만든 줄: 빈 칸을 채움 (투자비중은 당시 100%)
+            r = r + [""] * (width - len(r))
+            r[-1] = r[-1] or "1.0"
+        fixed.append(r)
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        csv.writer(f, lineterminator="\n").writerows(rows)
+        csv.writer(f, lineterminator="\n").writerows([SUMMARY_HEADER] + fixed)
 
 
 def save_outputs(cfg, raw_text, eq, benches, primary, trades, holding, label):
@@ -273,6 +302,7 @@ def save_outputs(cfg, raw_text, eq, benches, primary, trades, holding, label):
          f"- 실행 시각: {datetime.now(KST):%Y-%m-%d %H:%M} (KST)",
          f"- 기간: {eq.index[0].date()} ~ {eq.index[-1].date()}",
          f"- 매매 종목: {nm(trade_t)} ({trade_t})",
+         f"- 투자 비중: 매수할 때 현금의 {float(cfg['entry']['invest_fraction']) * 100:.0f}%만 투자, 나머지는 현금",
          f"- 비교 기준(벤치마크): 시작일에 같은 금액으로 사서 끝까지 보유 / 목표 판정 기준은 **{pname}**", "",
          "## 목표 달성 체크", "",
          f"목표: 같은 기간 {pname} 수익률을 소폭이라도 넘으면서, 최대 낙폭은 더 작게", ""]
@@ -310,6 +340,24 @@ def save_outputs(cfg, raw_text, eq, benches, primary, trades, holding, label):
         L += [f"- 백테스트 종료 시점에 보유 중: {holding['entry_date']} 진입, 현재 수익률 {holding['return_pct']}%", ""]
     if chart:
         L += ["![equity](equity.png)", ""]
+    ws = window_summary(trades, eq, ss["mdd_from"], ss["mdd_to"])
+    L += [f"## 최대 낙폭 구간의 거래 요약 ({ss['mdd_from']} → {ss['mdd_to']})", ""]
+    if ws["n"] == 0:
+        L += ["이 구간에서 청산된 거래가 없습니다.", ""]
+    else:
+        L += ["| 항목 | 값 |", "|---|---|",
+              f"| 청산된 거래 수 | {ws['n']} (이익 {ws['wins']} / 손실 {ws['losses']}) |",
+              f"| 승률(%) | {fmt(ws['win_rate'])} |",
+              f"| 이익 거래 평균(%) | {fmt(ws['avg_win'], 2)} |",
+              f"| 손실 거래 평균(%) | {fmt(ws['avg_loss'], 2)} |",
+              f"| 거래 손익 복리 합계(%) | {fmt(ws['comp'], 2)} |",
+              f"| 최대 연속 손실 횟수 | {ws['streak']} |",
+              f"| 이 구간에서 시장에 들어가 있던 날 비율(%) | {fmt(ws['exposure'])} |",
+              "", "가장 크게 잃은 거래 5건", "",
+              "| 진입일 | 청산일 | 사유 | 수익률(%) | 보유일 |", "|---|---|---|---|---|"]
+        for _, t in ws["worst"].iterrows():
+            L.append(f"| {t.entry_date} | {t.exit_date} | {t.reason} | {t.return_pct} | {t.hold_days} |")
+        L.append("")
     L += ["## 연도별 수익률(%)", "",
           "| 연도 | 이 전략 | " + " | ".join(nm(t) for t in tickers) + f" | 전략 - {pname} (%p) |",
           "|---|---|" + "---|" * len(tickers) + "---|"]
@@ -328,9 +376,10 @@ def save_outputs(cfg, raw_text, eq, benches, primary, trades, holding, label):
     L += ["", "## 가정과 한계 (꼭 읽어주세요)", "",
           "- 신호는 외환 **일봉 종가** 기준이고, 매매는 **다음 코스피 거래일**에 체결된다고 가정했습니다(미래 데이터 엿보기 방지).",
           "- 실제 알림은 15분마다 장중 가격으로 판단하므로 결과가 이 백테스트와 다를 수 있습니다.",
-          "- 벤치마크는 시작일 종가에 같은 금액을 넣어 끝까지 보유한 것으로 계산했습니다. 코스피 지수는 배당이 빠진 가격 지수이고, ETF는 배당이 반영된 조정주가입니다.",
+          "- 벤치마크는 시작일 종가에 같은 금액을 넣어 끝까지 보유한 것으로 계산했습니다. ETF는 배당이 반영된 조정주가입니다(코스피 지수 ^KS11은 배당 없는 가격 지수).",
+          "- 투자 비중이 100% 미만이면 거래별 수익률은 투자금이 아닌 전체 자산 대비로 표시됩니다.",
           "- 전략은 시장 밖에 있는 동안 현금 이자를 0%로 계산했습니다.",
-          "- 전액 매수이며 소수점 수량도 허용합니다. 호가 단위, 미체결, 시초가 급변은 반영하지 않았습니다.",
+          "- 소수점 수량도 허용합니다(실제로는 정수 주식만 가능). 호가 단위, 미체결, 시초가 급변은 반영하지 않았습니다.",
           "- 같은 날 손절과 익절이 모두 가능한 경우 손절이 먼저라고 보수적으로 가정했습니다.",
           "- 과거 결과가 미래를 보장하지 않습니다. 조건을 여러 번 바꿔가며 가장 좋은 값만 고르면 과거에만 잘 맞는 설정(과최적화)이 되기 쉽습니다. 연도별 결과가 고르게 좋은지 함께 보세요.",
           "", "## 이번에 사용한 설정", "", "```toml", raw_text.strip(), "```", ""]
@@ -350,7 +399,8 @@ def save_outputs(cfg, raw_text, eq, benches, primary, trades, holding, label):
         round(ts["win"], 1) if ts["n"] else "",
         round(hb["total"], 1), round(hb["cagr"], 1), round(hb["mdd"], 1), folder,
         pname, round(pb["cagr"], 1), round(pb["mdd"], 1),
-        round(ss["cagr"] - pb["cagr"], 1), round(ss["mdd"] - pb["mdd"], 1)])
+        round(ss["cagr"] - pb["cagr"], 1), round(ss["mdd"] - pb["mdd"], 1),
+        float(en["invest_fraction"])])
     return folder, ss, pb, pname, ts
 
 
@@ -359,10 +409,11 @@ DEFAULTS = {
     "start_date": "2012-01-01", "end_date": "", "label": "기본",
     "market": {"trade_ticker": "122630.KS",
                "fx_pairs": ["EURUSD=X", "GBPUSD=X", "AUDUSD=X"]},
-    "benchmark": {"tickers": ["^KS11", "069500.KS"]},
+    "benchmark": {"tickers": ["069500.KS"]},
     "signal": {"ma_short": 5, "ma_mid": 10, "ma_long": 20,
                "buy_threshold": 2, "sell_threshold": -2, "confirm_days": 1},
-    "entry": {"execution": "next_open", "reentry_after_take_profit": False},
+    "entry": {"execution": "next_open", "reentry_after_take_profit": False,
+              "invest_fraction": 1.0},
     "exit": {"take_profit_pct": 5.0, "stop_loss_pct": 0.0,
              "exit_on_neutral": True, "exit_on_down": True},
     "cost": {"fee_pct_per_side": 0.015, "slippage_pct_per_side": 0.05},
@@ -381,6 +432,8 @@ def run(cfg, raw_text="", loader=download):
         raise ValueError('execution 은 "next_open" 또는 "next_close" 만 가능합니다')
     if int(cfg["signal"]["confirm_days"]) < 1:
         raise ValueError("confirm_days 는 1 이상이어야 합니다")
+    if not 0 < float(cfg["entry"]["invest_fraction"]) <= 1:
+        raise ValueError("invest_fraction 은 0보다 크고 1 이하여야 합니다 (예: 0.5 = 투자금의 50%)")
     start = cfg["start_date"]
     end = cfg["end_date"] or None
     warm = (pd.Timestamp(start) - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
