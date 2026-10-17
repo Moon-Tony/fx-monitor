@@ -1,6 +1,7 @@
 """과거 데이터 백테스트: 외환 3종 점수 신호로 코스피 ETF(예: KODEX 레버리지)를 매매했다면?
 
 조건은 backtest_settings.toml 에서만 바꾸면 됩니다 (이 파일은 고치지 않아도 됩니다).
+한 번 실행하면 전체 기간과 함께 설정한 구간(기본: 전반 2012~2019, 후반 2020~)별 성과도 보고서에 나옵니다.
 결과는 backtest_results/ 폴더에 (보고서 report.md, 거래기록 trades.csv, 그래프 equity.png) 저장되고,
 실행할 때마다 backtest_results/summary.csv 에 한 줄씩 쌓여서 조건별 비교가 쉽습니다.
 비교 기준(벤치마크)은 시작일에 같은 금액으로 사서 끝까지 보유한 결과입니다 (기본: KODEX 200).
@@ -180,6 +181,31 @@ def stats(eq):
                 mdd_from=peak.date(), mdd_to=trough.date())
 
 
+def period_slice(eq, start, end):
+    """eq 중 [start, end] 구간. 구간 시작 전날 값을 기준점으로 붙여서 첫날 손익도 반영"""
+    s = pd.Timestamp(start) if start else eq.index[0]
+    e = pd.Timestamp(end) if end else eq.index[-1]
+    seg = eq.loc[s:e]
+    prev = eq.loc[:s - pd.Timedelta(days=1)]
+    if len(prev):
+        seg = pd.concat([prev.iloc[-1:], seg])
+    return seg
+
+
+def period_stats(eq, benches, primary, periods):
+    """전체 기간 결과를 구간별로 잘라서 성과 계산 (구간마다 새로 실행하지 않음)"""
+    rows = []
+    for p in periods:
+        name, start, end = p.get("name", ""), p.get("start", ""), p.get("end", "")
+        se, sb = period_slice(eq, start, end), period_slice(benches[primary], start, end)
+        if len(se) < 20 or len(sb) < 20:
+            continue
+        first = eq.loc[pd.Timestamp(start):].index[0] if start else eq.index[0]
+        rows.append(dict(name=name, d0=first.date(), d1=se.index[-1].date(),
+                         s=stats(se), b=stats(sb)))
+    return rows
+
+
 def yearly(eq):
     ye = eq.groupby(eq.index.year).last()
     base = ye.shift(1)
@@ -230,7 +256,9 @@ SUMMARY_HEADER = ["실행시각", "이름", "기간시작", "기간끝", "이평
                   "수수료%", "슬리피지%", "전략누적%", "전략CAGR%", "전략MDD%", "거래수", "승률%",
                   "보유누적%", "보유CAGR%", "보유MDD%", "결과폴더",
                   "기준종목", "기준CAGR%", "기준MDD%",
-                  "CAGR차이%p(전략-기준)", "MDD차이%p(전략-기준 / +면 덜 빠짐)", "투자비중"]
+                  "CAGR차이%p(전략-기준)", "MDD차이%p(전략-기준 / +면 덜 빠짐)", "투자비중",
+                  "구간별 CAGR%/MDD% (전략 | 기준)"]
+OLD_WIDTH = SUMMARY_HEADER.index("투자비중") + 1   # 투자비중 칸이 생기기 전에 만든 줄 판별용
 
 
 def append_summary(path, row):
@@ -242,9 +270,11 @@ def append_summary(path, row):
     width = len(SUMMARY_HEADER)
     fixed = []
     for r in body + [row]:
-        if len(r) < width:                       # 예전에 만든 줄: 빈 칸을 채움 (투자비중은 당시 100%)
+        if len(r) < OLD_WIDTH:                   # 투자비중 칸이 없던 줄: 당시는 100% 투자
+            r = r + [""] * (OLD_WIDTH - len(r))
+            r[OLD_WIDTH - 1] = r[OLD_WIDTH - 1] or "1.0"
+        if len(r) < width:                       # 예전에 만든 줄: 새 칸은 빈 칸으로
             r = r + [""] * (width - len(r))
-            r[-1] = r[-1] or "1.0"
         fixed.append(r)
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         csv.writer(f, lineterminator="\n").writerows([SUMMARY_HEADER] + fixed)
@@ -264,6 +294,7 @@ def save_outputs(cfg, raw_text, eq, benches, primary, trades, holding, label):
     ys = yearly(eq)
     yb = {t: yearly(s) for t, s in benches.items()}
     pb, yp, pname = bs[primary], yb[primary], nm(primary)
+    prows = period_stats(eq, benches, primary, cfg["periods"])
 
     # ---- 그래프: 누적 수익률 + 낙폭
     chart = False
@@ -320,7 +351,22 @@ def save_outputs(cfg, raw_text, eq, benches, primary, trades, holding, label):
           f"(전략이 {abs(abs(ss['mdd']) - abs(pb['mdd'])):.1f}%p {'더 작음' if ok2 else '더 큼'})",
           f"- 참고: {pname}가 오른 {len(up)}개 연도 중 전략이 앞선 해 {up_win}개, "
           f"내린 {len(down)}개 연도 중 전략이 덜 잃은 해 {down_win}개 (첫 해와 마지막 해는 일부 기간만 포함)",
-          f"- 종합: **{verdict}**", "",
+          f"- 종합: **{verdict}**", ""]
+    if prows:
+        L += ["### 구간별 성과", "",
+              "전체 기간을 한 번 실행한 결과를 구간별로 잘라 계산했습니다. "
+              "구간 시작일에 이미 보유 중이면 그대로 이어서 계산합니다.", "",
+              f"| 구간 | 기간 | 전략 연평균(%) | {pname} 연평균(%) | 전략 최대낙폭(%) | {pname} 최대낙폭(%) "
+              f"| 낙폭 대비 수익 (전략 / {pname}) | 목표 충족 |",
+              "|---|---|---|---|---|---|---|---|"]
+        for r in prows:
+            a, b = r["s"], r["b"]
+            k1, k2 = a["cagr"] > b["cagr"], abs(a["mdd"]) < abs(b["mdd"])
+            mark = "✅ 둘 다" if k1 and k2 else "수익률만" if k1 else "낙폭만" if k2 else "❌"
+            L.append(f"| {r['name']} | {r['d0']} ~ {r['d1']} | {fmt(a['cagr'])} | {fmt(b['cagr'])} | "
+                     f"{fmt(a['mdd'])} | {fmt(b['mdd'])} | {fmt(a['calmar'], 2)} / {fmt(b['calmar'], 2)} | {mark} |")
+        L.append("")
+    L += [
           "## 핵심 성과", "",
           "| 항목 | 이 전략 | " + " | ".join(heads) + " |",
           "|---|---|" + "---|" * len(tickers),
@@ -400,13 +446,17 @@ def save_outputs(cfg, raw_text, eq, benches, primary, trades, holding, label):
         round(hb["total"], 1), round(hb["cagr"], 1), round(hb["mdd"], 1), folder,
         pname, round(pb["cagr"], 1), round(pb["mdd"], 1),
         round(ss["cagr"] - pb["cagr"], 1), round(ss["mdd"] - pb["mdd"], 1),
-        float(en["invest_fraction"])])
-    return folder, ss, pb, pname, ts
+        float(en["invest_fraction"]),
+        " / ".join(f"{r['name']} {r['s']['cagr']:.1f}/{r['s']['mdd']:.1f} | {r['b']['cagr']:.1f}/{r['b']['mdd']:.1f}"
+                   for r in prows)])
+    return folder, ss, pb, pname, ts, prows
 
 
 # ---------------------------------------------------------------- 실행
 DEFAULTS = {
     "start_date": "2012-01-01", "end_date": "", "label": "기본",
+    "periods": [{"name": "전반", "start": "2012-01-01", "end": "2019-12-31"},
+                {"name": "후반", "start": "2020-01-01", "end": ""}],
     "market": {"trade_ticker": "122630.KS",
                "fx_pairs": ["EURUSD=X", "GBPUSD=X", "AUDUSD=X"]},
     "benchmark": {"tickers": ["069500.KS"]},
@@ -466,10 +516,13 @@ def main():
     with open(SETTINGS_FILE, "rb") as f:
         raw = f.read()
     cfg = merged(tomllib.loads(raw.decode("utf-8")))
-    folder, ss, pb, pname, ts = run(cfg, raw.decode("utf-8"))
+    folder, ss, pb, pname, ts, prows = run(cfg, raw.decode("utf-8"))
     print(f"결과 폴더: {folder}")
     print(f"전략  누적 {ss['total']:.1f}%  CAGR {ss['cagr']:.1f}%  MDD {ss['mdd']:.1f}%  거래 {ts['n']}회")
     print(f"{pname}  누적 {pb['total']:.1f}%  CAGR {pb['cagr']:.1f}%  MDD {pb['mdd']:.1f}%")
+    for r in prows:
+        print(f"[{r['name']}] 전략 CAGR {r['s']['cagr']:.1f}% MDD {r['s']['mdd']:.1f}%  /  "
+              f"{pname} CAGR {r['b']['cagr']:.1f}% MDD {r['b']['mdd']:.1f}%")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,13 @@ label = "비중75_전체"
 start_date = "2012-01-02"
 end_date = "2026-10-17"
 
+# 구간별 성과: 전체 기간을 한 번 실행한 결과를 아래 구간으로 잘라 보고서에 따로 보여줍니다.
+# 구간마다 다시 실행할 필요가 없습니다. end 를 비워두면 백테스트 끝까지입니다.
+periods = [
+  { name = "전반", start = "2012-01-01", end = "2019-12-31" },
+  { name = "후반", start = "2020-01-01", end = "" },
+]
+
 [market]
 trade_ticker = "122630.KS"                         # 매매할 종목 (122630.KS = KODEX 레버리지, 069500.KS = KODEX 200)
 fx_pairs = ["EURUSD=X", "GBPUSD=X", "AUDUSD=X"]    # 점수를 매길 외환
